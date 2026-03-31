@@ -18,27 +18,30 @@ export const DASHBOARD_CONFIG = {
   // Chain name shown in UI
   chainName: process.env.NEXT_PUBLIC_CHAIN_NAME || "HyperEVM",
 
-  // Native token symbol
-  nativeSymbol: "HYPE",
+  // Native token symbol — set via env or auto-detected from token transfers
+  // If the staking token is an ERC20 (e.g. "based"), this will be overridden
+  // by actual token transfer data in the classifier.
+  nativeSymbol: process.env.NEXT_PUBLIC_NATIVE_SYMBOL || "HYPE",
+
+  // Primary staking token symbol (ERC20 if different from native)
+  // Set this if the staking token is NOT the native gas token.
+  // e.g. "based" for the based token on HyperEVM
+  stakingTokenSymbol: process.env.NEXT_PUBLIC_STAKING_TOKEN_SYMBOL || null,
 
   // Native token decimals
   nativeDecimals: 18,
 
   // Approximate unlock delay in ms after unstake request
-  // HyperEVM staking: if the unlock epoch/delay is known, set it here.
-  // 7 days = 604800000ms — placeholder, update with actual chain parameter
-  unstakeUnlockDelayMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+  // HyperEVM staking: update with actual chain/protocol unlock period
+  // 7 days = 604800000ms — placeholder
+  unstakeUnlockDelayMs: 7 * 24 * 60 * 60 * 1000,
 
   // Known staking contract addresses on HyperEVM
-  // These are best-effort; update with verified addresses
-  // NOTE: HyperEVM uses system precompile 0x0000...0800 range for staking
-  knownStakingContracts: [
-    // Hyperliquid staking precompile addresses (to be verified)
-    "0x0000000000000000000000000000000000000800",
-    "0x0000000000000000000000000000000000000801",
-    "0x0000000000000000000000000000000000000802",
-    // Add verified staking contract addresses here
-  ] as string[],
+  // Add the actual staking contract address once identified from explorer.
+  // Check: https://www.hyperscan.com/address/<contract>
+  knownStakingContracts: (
+    process.env.NEXT_PUBLIC_STAKING_CONTRACTS?.split(",").map((s) => s.trim()) ?? []
+  ) as string[],
 
   // Items per page for table display
   pageSize: 25,

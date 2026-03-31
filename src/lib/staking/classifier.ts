@@ -2,13 +2,18 @@
  * Classifies a NormalizedTx into a staking action type.
  *
  * Classification priority (highest → lowest):
- * 1. Decoded method name (if Blockscout decoded the ABI)
- * 2. Method ID lookup against known signatures
- * 3. Event log topic0 lookup
- * 4. Value/transfer flow heuristics
- * 5. Contract address heuristic (known staking contracts)
- * 6. Keyword scan on method name
- * 7. Fallback → non_staking
+ * 1. Decoded method name (Blockscout decoded ABI)
+ * 2. Method ID 4-byte lookup
+ * 3. Event log topic0
+ * 4. ERC20 token transfer direction (KEY: "based" and similar staking tokens)
+ * 5. Value/transfer flow heuristics
+ * 6. Known staking contract address
+ * 7. Keyword scan on method name
+ * 8. Fallback → non_staking
+ *
+ * Token symbol resolution priority:
+ * 1. Largest ERC20 token transfer (captures "based", "stHYPE", etc.)
+ * 2. Native gas token (HYPE or configured nativeSymbol)
  */
 
 import type { NormalizedTx, ClassifiedStakingAction, ActionType, ConfidenceLevel } from "./types";
@@ -21,10 +26,10 @@ import {
   STAKING_KEYWORDS,
 } from "@/config/classifier";
 import { weiToFormatted } from "@/lib/utils/amount";
-import { normalizeAddress, isSameAddress } from "@/lib/utils/tx";
-import { isEmptyCalldata } from "@/lib/utils/tx";
+import { normalizeAddress, isSameAddress, isEmptyCalldata } from "@/lib/utils/tx";
+import type { TokenTransfer } from "./types";
 
-const { nativeDecimals, nativeSymbol, knownStakingContracts, targetAddress } =
+const { nativeDecimals, nativeSymbol, stakingTokenSymbol, knownStakingContracts, targetAddress } =
   DASHBOARD_CONFIG;
 
 const TARGET = normalizeAddress(targetAddress);
@@ -37,17 +42,16 @@ const KNOWN_STAKING = new Set(
 // ─────────────────────────────────────────────
 
 export function classifyTransaction(tx: NormalizedTx): ClassifiedStakingAction {
-  // Try each strategy in priority order
   const result =
     tryMethodNameClassify(tx) ??
     tryMethodIdClassify(tx) ??
     tryEventLogClassify(tx) ??
+    tryTokenTransferClassify(tx) ??   // ← ERC20 transfer direction heuristic
     tryValueFlowClassify(tx) ??
     tryKnownContractClassify(tx) ??
     tryKeywordClassify(tx) ??
     fallbackClassify(tx);
 
-  // Determine amount: prefer token transfer amount over native value for staking txs
   const { amountWei, tokenSymbol } = resolveAmount(tx, result.actionType);
 
   return {
@@ -83,10 +87,8 @@ interface ClassifyResult {
 function tryMethodNameClassify(tx: NormalizedTx): ClassifyResult | null {
   const method = tx.method?.toLowerCase().trim();
   if (!method) return null;
-
   const action = METHOD_TO_ACTION[method] as ActionType | undefined;
   if (!action) return null;
-
   return {
     actionType: action,
     confidence: "high",
@@ -98,14 +100,11 @@ function tryMethodNameClassify(tx: NormalizedTx): ClassifyResult | null {
 /** Strategy 2: method ID 4-byte lookup */
 function tryMethodIdClassify(tx: NormalizedTx): ClassifyResult | null {
   if (!tx.methodId) return null;
-
   const sig = KNOWN_METHOD_SIGNATURES[tx.methodId];
   if (!sig) return null;
-
   const methodName = sig.split("(")[0].toLowerCase();
   const action = METHOD_TO_ACTION[methodName] as ActionType | undefined;
   if (!action) return null;
-
   return {
     actionType: action,
     confidence: "high",
@@ -119,14 +118,11 @@ function tryEventLogClassify(tx: NormalizedTx): ClassifyResult | null {
   for (const log of tx.logs) {
     const topic0 = log.topics[0]?.toLowerCase();
     if (!topic0) continue;
-
     const eventSig = KNOWN_EVENT_TOPICS[topic0];
     if (!eventSig) continue;
-
     const eventName = eventSig.toLowerCase();
     const action = EVENT_TO_ACTION[eventName] as ActionType | undefined;
     if (!action) continue;
-
     return {
       actionType: action,
       confidence: "medium",
@@ -137,13 +133,62 @@ function tryEventLogClassify(tx: NormalizedTx): ClassifyResult | null {
   return null;
 }
 
-/** Strategy 4: value/transfer flow heuristic */
+/**
+ * Strategy 4: ERC20 token transfer direction heuristic.
+ *
+ * This catches ERC20-based staking (e.g. "based" token) where:
+ * - target sends ERC20 OUT to a contract = stake/deposit
+ * - target receives ERC20 IN from a contract (no matching out) = claim/withdrawal
+ *
+ * Only applies when there are token transfers and calldata is present
+ * (distinguishing from simple token transfers).
+ */
+function tryTokenTransferClassify(tx: NormalizedTx): ClassifyResult | null {
+  if (tx.tokenTransfers.length === 0) return null;
+
+  const outTransfers = tx.tokenTransfers.filter((t) => t.direction === "out");
+  const inTransfers = tx.tokenTransfers.filter((t) => t.direction === "in");
+
+  // If configured staking token matches, higher confidence
+  const primaryOut = getLargestTransfer(outTransfers);
+  const primaryIn = getLargestTransfer(inTransfers);
+
+  const isStakingToken = (t: TokenTransfer | null) =>
+    t !== null &&
+    stakingTokenSymbol !== null &&
+    (t.tokenSymbol?.toLowerCase() === stakingTokenSymbol.toLowerCase());
+
+  // ERC20 sent OUT during a contract call = stake/deposit
+  if (primaryOut && !isEmptyCalldata(tx.rawInput)) {
+    const isKnownStakingTok = isStakingToken(primaryOut);
+    return {
+      actionType: "stake",
+      confidence: isKnownStakingTok ? "high" : "medium",
+      reason: `ERC20 token "${primaryOut.tokenSymbol}" sent out to contract${isKnownStakingTok ? " (configured staking token)" : ""}`,
+      parserSource: "value_flow",
+    };
+  }
+
+  // ERC20 received IN from a contract = claim/withdrawal
+  if (primaryIn && !primaryOut && !isEmptyCalldata(tx.rawInput)) {
+    const isKnownStakingTok = isStakingToken(primaryIn);
+    return {
+      actionType: "unstake_claim",
+      confidence: isKnownStakingTok ? "high" : "medium",
+      reason: `ERC20 token "${primaryIn.tokenSymbol}" received from contract${isKnownStakingTok ? " (configured staking token)" : ""}`,
+      parserSource: "value_flow",
+    };
+  }
+
+  return null;
+}
+
+/** Strategy 5: native value flow heuristic */
 function tryValueFlowClassify(tx: NormalizedTx): ClassifyResult | null {
   const to = tx.to ?? "";
   const from = tx.from;
   const hasValue = BigInt(tx.value ?? "0") > 0n;
 
-  // Native ETH sent FROM target TO a contract (no calldata) = potential stake
   if (
     isSameAddress(from, TARGET) &&
     to !== TARGET &&
@@ -159,7 +204,6 @@ function tryValueFlowClassify(tx: NormalizedTx): ClassifyResult | null {
     };
   }
 
-  // Native ETH received TO target FROM a contract = potential claim/withdrawal
   if (
     isSameAddress(to, TARGET) &&
     from !== TARGET &&
@@ -177,11 +221,10 @@ function tryValueFlowClassify(tx: NormalizedTx): ClassifyResult | null {
   return null;
 }
 
-/** Strategy 5: known staking contract address */
+/** Strategy 6: known staking contract address */
 function tryKnownContractClassify(tx: NormalizedTx): ClassifyResult | null {
   const to = normalizeAddress(tx.to ?? "");
   if (!KNOWN_STAKING.has(to)) return null;
-
   return {
     actionType: "staking_related_unknown",
     confidence: "medium",
@@ -190,16 +233,14 @@ function tryKnownContractClassify(tx: NormalizedTx): ClassifyResult | null {
   };
 }
 
-/** Strategy 6: keyword scan on method name */
+/** Strategy 7: keyword scan on method name */
 function tryKeywordClassify(tx: NormalizedTx): ClassifyResult | null {
   const method = (tx.method ?? "").toLowerCase();
   if (!method) return null;
-
   for (const keyword of STAKING_KEYWORDS) {
     if (method.includes(keyword)) {
-      const action = guessActionFromKeyword(keyword);
       return {
-        actionType: action,
+        actionType: guessActionFromKeyword(keyword),
         confidence: "low",
         reason: `Method name contains staking keyword: "${keyword}"`,
         parserSource: "heuristic",
@@ -209,12 +250,11 @@ function tryKeywordClassify(tx: NormalizedTx): ClassifyResult | null {
   return null;
 }
 
-/** Fallback: no classification */
+/** Fallback */
 function fallbackClassify(tx: NormalizedTx): ClassifyResult {
-  // If value is 0 and target is sender, it's a contract interaction we don't understand
   if (
     isSameAddress(tx.from, TARGET) &&
-    (BigInt(tx.value ?? "0") === 0n) &&
+    BigInt(tx.value ?? "0") === 0n &&
     tx.to
   ) {
     return {
@@ -224,7 +264,6 @@ function fallbackClassify(tx: NormalizedTx): ClassifyResult {
       parserSource: "unknown",
     };
   }
-
   return {
     actionType: "non_staking",
     confidence: "medium",
@@ -234,8 +273,83 @@ function fallbackClassify(tx: NormalizedTx): ClassifyResult {
 }
 
 // ─────────────────────────────────────────────
+// Amount resolution
+// ─────────────────────────────────────────────
+
+/**
+ * Resolves the primary staking amount and token symbol.
+ *
+ * Priority:
+ * 1. Largest ERC20 token transfer in the relevant direction
+ *    (captures "based", "stHYPE", or any ERC20 staking token)
+ * 2. Native gas value as fallback
+ */
+function resolveAmount(
+  tx: NormalizedTx,
+  actionType: ActionType
+): { amountWei: string; tokenSymbol: string } {
+  const outTransfers = tx.tokenTransfers.filter((t) => t.direction === "out");
+  const inTransfers = tx.tokenTransfers.filter((t) => t.direction === "in");
+
+  // For stake/unstake_request: look at outgoing transfers first
+  if (actionType === "stake" || actionType === "unstake_request" || actionType === "restake") {
+    const largest = getLargestTransfer(outTransfers);
+    if (largest && BigInt(largest.rawAmount) > 0n) {
+      return {
+        amountWei: largest.rawAmount,
+        tokenSymbol: largest.tokenSymbol ?? nativeSymbol,
+      };
+    }
+    // If no outgoing ERC20, check if any transfer with staking token symbol exists
+    const anyStaking = tx.tokenTransfers.find(
+      (t) => stakingTokenSymbol && t.tokenSymbol?.toLowerCase() === stakingTokenSymbol.toLowerCase()
+    );
+    if (anyStaking) {
+      return { amountWei: anyStaking.rawAmount, tokenSymbol: anyStaking.tokenSymbol ?? nativeSymbol };
+    }
+  }
+
+  // For claim/withdrawal: look at incoming transfers
+  if (actionType === "unstake_claim" || actionType === "withdraw" || actionType === "reward_claim") {
+    const largest = getLargestTransfer(inTransfers);
+    if (largest && BigInt(largest.rawAmount) > 0n) {
+      return {
+        amountWei: largest.rawAmount,
+        tokenSymbol: largest.tokenSymbol ?? nativeSymbol,
+      };
+    }
+  }
+
+  // For unknown staking actions: use largest transfer of any direction
+  if (actionType === "staking_related_unknown") {
+    const allTransfers = tx.tokenTransfers;
+    const largest = getLargestTransfer(allTransfers);
+    if (largest && BigInt(largest.rawAmount) > 0n) {
+      return {
+        amountWei: largest.rawAmount,
+        tokenSymbol: largest.tokenSymbol ?? nativeSymbol,
+      };
+    }
+  }
+
+  // Fallback: native gas value
+  return { amountWei: tx.value ?? "0", tokenSymbol: nativeSymbol };
+}
+
+// ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
+
+function getLargestTransfer(transfers: TokenTransfer[]): TokenTransfer | null {
+  if (transfers.length === 0) return null;
+  return transfers.reduce((a, b) => {
+    try {
+      return BigInt(a.rawAmount) >= BigInt(b.rawAmount) ? a : b;
+    } catch {
+      return a;
+    }
+  });
+}
 
 function guessActionFromKeyword(keyword: string): ActionType {
   if (["stake", "delegate", "deposit"].includes(keyword)) return "stake";
@@ -246,54 +360,34 @@ function guessActionFromKeyword(keyword: string): ActionType {
   return "staking_related_unknown";
 }
 
-/**
- * Resolve the primary amount and token symbol for the action.
- * For staking txs, prefer the value moved. For token-based staking, use token transfer amount.
- */
-function resolveAmount(
-  tx: NormalizedTx,
-  actionType: ActionType
-): { amountWei: string; tokenSymbol: string } {
-  // If there are outgoing token transfers, prefer the largest outgoing one
-  const outTransfers = tx.tokenTransfers.filter((t) => t.direction === "out");
-  const inTransfers = tx.tokenTransfers.filter((t) => t.direction === "in");
-
-  if (actionType === "stake" || actionType === "unstake_request") {
-    if (outTransfers.length > 0) {
-      const largest = outTransfers.reduce((a, b) =>
-        BigInt(a.rawAmount) > BigInt(b.rawAmount) ? a : b
-      );
-      return {
-        amountWei: largest.rawAmount,
-        tokenSymbol: largest.tokenSymbol ?? nativeSymbol,
-      };
-    }
-  }
-
-  if (actionType === "unstake_claim" || actionType === "reward_claim") {
-    if (inTransfers.length > 0) {
-      const largest = inTransfers.reduce((a, b) =>
-        BigInt(a.rawAmount) > BigInt(b.rawAmount) ? a : b
-      );
-      return {
-        amountWei: largest.rawAmount,
-        tokenSymbol: largest.tokenSymbol ?? nativeSymbol,
-      };
-    }
-  }
-
-  // Fall back to native value
-  return { amountWei: tx.value ?? "0", tokenSymbol: nativeSymbol };
-}
-
-/**
- * Addresses that are clearly NOT staking contracts
- * (add as needed)
- */
-const KNOWN_NON_STAKING = new Set<string>([
-  // e.g. known DEX routers, bridges, etc.
-]);
+const KNOWN_NON_STAKING = new Set<string>([]);
 
 function isKnownNonStaking(addr: string): boolean {
   return KNOWN_NON_STAKING.has(normalizeAddress(addr));
+}
+
+// ─────────────────────────────────────────────
+// Auto-detect dominant staking token from actions
+// ─────────────────────────────────────────────
+
+/**
+ * Scans all classified actions and returns the most common ERC20 token symbol
+ * found in staking-related transactions. Useful for showing the correct token
+ * in summary cards when the staking token is ERC20 (e.g. "based").
+ */
+export function detectDominantStakingToken(
+  actions: ClassifiedStakingAction[]
+): string {
+  if (stakingTokenSymbol) return stakingTokenSymbol;
+
+  const counts: Record<string, number> = {};
+  for (const a of actions) {
+    if (a.actionType === "non_staking") continue;
+    if (a.tokenSymbol && a.tokenSymbol !== nativeSymbol) {
+      counts[a.tokenSymbol] = (counts[a.tokenSymbol] ?? 0) + 1;
+    }
+  }
+
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  return sorted.length > 0 ? sorted[0][0] : nativeSymbol;
 }
